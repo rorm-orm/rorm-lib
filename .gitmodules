@@ -1,0 +1,9 @@
+[submodule "rorm-sql"]
+	path = rorm-sql
+	url = https://github.com/rorm-orm/rorm-sql
+[submodule "rorm-db"]
+	path = rorm-db
+	url = https://github.com/rorm-orm/rorm-db
+[submodule "rorm-declaration"]
+	path = rorm-declaration
+	url = https://github.com/rorm-orm/rorm-declaration
