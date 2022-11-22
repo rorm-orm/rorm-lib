@@ -1,8 +1,6 @@
 //! This crate is used to provide C bindings for the `rorm-db` crate.
 #![deny(missing_docs)]
 
-extern crate core;
-
 /// Utility module to provide errors
 pub mod errors;
 /// Module that holds the definitions for conditions.
@@ -14,6 +12,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::StreamExt;
+use rorm_db::database::{ColumnSelector, JoinTable};
+use rorm_db::join_table::JoinType;
+use rorm_db::ordering::OrderByEntry;
 use rorm_db::row::Row;
 use rorm_db::transaction::Transaction;
 use rorm_db::value::Value;
@@ -21,7 +22,10 @@ use rorm_db::{Database, DatabaseConfiguration};
 use tokio::runtime::Runtime;
 
 use crate::errors::Error;
-use crate::representations::{Condition, DBConnectOptions, FFIUpdate, FFIValue};
+use crate::representations::{
+    DBConnectOptions, FFIColumnSelector, FFICondition, FFIJoin, FFILimitClause, FFIOrderByEntry,
+    FFIUpdate, FFIValue,
+};
 use crate::utils::{
     get_data_from_row, FFIDate, FFIDateTime, FFIOption, FFISlice, FFIString, FFITime, Stream,
     VoidPtr,
@@ -59,6 +63,8 @@ pub extern "C" fn rorm_runtime_start(
             match Runtime::new() {
                 Ok(rt) => {
                     *rt_opt = Some(rt);
+                    #[cfg(feature = "logging")]
+                    env_logger::init();
 
                     unsafe { cb(context, Error::NoError) }
                 }
@@ -439,12 +445,15 @@ specify a null pointer.
 - `transaction`: Mutable pointer to a Transaction. Can be a null pointer to ignore this parameter.
 - `model`: Name of the table to query.
 - `columns`: Array of columns to retrieve from the database.
+- `joins`: Array of joins to add to the query.
 - `condition`: Pointer to a [Condition].
+- `order_by`: Array of [FFIOrderByEntry].
+- `offset`: Optional offset to set to the query.
 - `callback`: callback function. Takes the `context`, a pointer to a row and an [Error].
 - `context`: Pass through void pointer.
 
 **Important**:
-- Make sure that `db`, `model`, `columns` and `condition` are
+- Make sure that `db`, `model`, `columns`, `joins` and `condition` are
 allocated until the callback is executed.
 
 This function is called from an asynchronous context.
@@ -454,8 +463,11 @@ pub extern "C" fn rorm_db_query_one(
     db: &'static Database,
     transaction: Option<&'static mut Transaction>,
     model: FFIString<'static>,
-    columns: FFISlice<'static, FFIString<'static>>,
-    condition: Option<&'static Condition>,
+    columns: FFISlice<'static, FFIColumnSelector<'static>>,
+    joins: FFISlice<'static, FFIJoin<'static>>,
+    condition: Option<&'static FFICondition>,
+    order_by: FFISlice<'static, FFIOrderByEntry<'static>>,
+    offset: FFIOption<u64>,
     callback: Option<unsafe extern "C" fn(VoidPtr, Option<Box<Row>>, Error) -> ()>,
     context: VoidPtr,
 ) {
@@ -467,16 +479,81 @@ pub extern "C" fn rorm_db_query_one(
         return;
     }
 
+    let offset = offset.into();
+
     let mut column_vec = vec![];
     {
-        let column_slice: &[FFIString] = columns.into();
-        for &x in column_slice {
-            let x_conv = x.try_into();
-            if x_conv.is_err() {
+        let column_slice: &[FFIColumnSelector] = columns.into();
+        for x in column_slice {
+            let table_name_conv: Option<FFIString> = (&x.table_name).into();
+            let table_name = match table_name_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            let Ok(column_name) = x.column_name.try_into() else {
                 unsafe { cb(context, None, Error::InvalidStringError) };
                 return;
-            }
-            column_vec.push(x_conv.unwrap());
+            };
+
+            let select_alias_conv: Option<FFIString> = (&x.select_alias).into();
+            let select_alias = match select_alias_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            column_vec.push(ColumnSelector {
+                table_name,
+                column_name,
+                select_alias,
+            });
+        }
+    }
+
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    {
+        let join_slice: &[FFIJoin] = joins.into();
+        for x in join_slice {
+            let join_type = x.join_type.into();
+
+            let Ok(table_name) = x.table_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let Ok(join_alias) = x.join_alias.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
+            {
+                Err(err) => match err {
+                    Error::InvalidStringError
+                    | Error::InvalidDateError
+                    | Error::InvalidTimeError
+                    | Error::InvalidDateTimeError => {
+                        unsafe { cb(context, None, err) };
+                        return;
+                    }
+                    _ => unreachable!("This error should never occur"),
+                },
+                Ok(v) => v,
+            };
+
+            join_tuple.push((join_type, table_name, join_alias, join_condition));
         }
     }
 
@@ -499,14 +576,55 @@ pub extern "C" fn rorm_db_query_one(
         None
     };
 
+    let mut order_by_vec = vec![];
+    {
+        let order_by_slice: &[FFIOrderByEntry] = order_by.into();
+        for x in order_by_slice {
+            let ordering = x.ordering.into();
+            let Ok(column_name) = x.column_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let table_name = match x.table_name {
+                FFIOption::None => None,
+                FFIOption::Some(v) => {
+                    let Ok(tn) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(tn)
+                }
+            };
+
+            order_by_vec.push(OrderByEntry {
+                ordering,
+                table_name,
+                column_name,
+            })
+        }
+    }
+
     let fut = async move {
+        let join_vec: Vec<JoinTable> = join_tuple
+            .iter()
+            .map(|(a, b, c, d)| JoinTable {
+                join_type: *a,
+                table_name: b,
+                join_alias: c,
+                join_condition: d,
+            })
+            .collect();
         match cond {
             None => {
                 match db
                     .query_one(
                         model_conv.unwrap(),
                         column_vec.as_slice(),
+                        join_vec.as_slice(),
                         None,
+                        &order_by_vec,
+                        offset,
                         transaction,
                     )
                     .await
@@ -522,12 +640,263 @@ pub extern "C" fn rorm_db_query_one(
                 .query_one(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
+                    join_vec.as_slice(),
                     Some(&c),
+                    &order_by_vec,
+                    offset,
                     transaction,
                 )
                 .await
             {
                 Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+                Err(err) => {
+                    let ffi_str = err.to_string();
+                    unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) }
+                }
+            },
+        }
+    };
+
+    let f = |err: String| {
+        unsafe { cb(context, None, Error::RuntimeError(err.as_str().into())) };
+    };
+    spawn_fut!(fut, cb(context, None, Error::MissingRuntimeError), f);
+}
+
+/**
+This function queries the database given the provided parameter and returns one optional matched row.
+If no results could be retrieved, None is returned.
+
+To include the statement in a transaction specify `transaction` as a valid
+Transaction. As the Transaction needs to be mutable, it is important to not
+use the Transaction anywhere else until the callback is finished.
+
+If the statement should be executed **not** in a Transaction,
+specify a null pointer.
+
+**Parameter**:
+- `db`: Reference to the Database, provided by [rorm_db_connect].
+- `transaction`: Mutable pointer to a Transaction. Can be a null pointer to ignore this parameter.
+- `model`: Name of the table to query.
+- `columns`: Array of columns to retrieve from the database.
+- `joins`: Array of joins to add to the query.
+- `condition`: Pointer to a [Condition].
+- `order_by`: Array of [FFIOrderByEntry].
+- `offset`: Optional offset to set to the query.
+- `callback`: callback function. Takes the `context`, a pointer to a row and an [Error].
+- `context`: Pass through void pointer.
+
+**Important**:
+- Make sure that `db`, `model`, `columns`, `joins` and `condition` are
+allocated until the callback is executed.
+
+This function is called from an asynchronous context.
+ */
+#[no_mangle]
+pub extern "C" fn rorm_db_query_optional(
+    db: &'static Database,
+    transaction: Option<&'static mut Transaction>,
+    model: FFIString<'static>,
+    columns: FFISlice<'static, FFIColumnSelector<'static>>,
+    joins: FFISlice<'static, FFIJoin<'static>>,
+    condition: Option<&'static FFICondition>,
+    order_by: FFISlice<'static, FFIOrderByEntry<'static>>,
+    offset: FFIOption<u64>,
+    callback: Option<unsafe extern "C" fn(VoidPtr, Option<Box<Row>>, Error) -> ()>,
+    context: VoidPtr,
+) {
+    let cb = callback.expect("Callback must not be empty");
+
+    let model_conv = model.try_into();
+    if model_conv.is_err() {
+        unsafe { cb(context, None, Error::InvalidStringError) };
+        return;
+    }
+
+    let offset = offset.into();
+
+    let mut column_vec = vec![];
+    {
+        let column_slice: &[FFIColumnSelector] = columns.into();
+        for x in column_slice {
+            let table_name_conv: Option<FFIString> = (&x.table_name).into();
+            let table_name = match table_name_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            let Ok(column_name) = x.column_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let select_alias_conv: Option<FFIString> = (&x.select_alias).into();
+            let select_alias = match select_alias_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            column_vec.push(ColumnSelector {
+                table_name,
+                column_name,
+                select_alias,
+            });
+        }
+    }
+
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    {
+        let join_slice: &[FFIJoin] = joins.into();
+        for x in join_slice {
+            let join_type = x.join_type.into();
+
+            let Ok(table_name) = x.table_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let Ok(join_alias) = x.join_alias.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
+            {
+                Err(err) => match err {
+                    Error::InvalidStringError
+                    | Error::InvalidDateError
+                    | Error::InvalidTimeError
+                    | Error::InvalidDateTimeError => {
+                        unsafe { cb(context, None, err) };
+                        return;
+                    }
+                    _ => unreachable!("This error should never occur"),
+                },
+                Ok(v) => v,
+            };
+
+            join_tuple.push((join_type, table_name, join_alias, join_condition));
+        }
+    }
+
+    let cond = if let Some(cond) = condition {
+        let cond_conv = cond.try_into();
+        if cond_conv.is_err() {
+            match cond_conv.as_ref().err().unwrap() {
+                Error::InvalidStringError
+                | Error::InvalidDateError
+                | Error::InvalidTimeError
+                | Error::InvalidDateTimeError => unsafe {
+                    cb(context, None, cond_conv.err().unwrap())
+                },
+                _ => {}
+            }
+            return;
+        }
+        Some(cond_conv.unwrap())
+    } else {
+        None
+    };
+
+    let mut order_by_vec = vec![];
+    {
+        let order_by_slice: &[FFIOrderByEntry] = order_by.into();
+        for x in order_by_slice {
+            let ordering = x.ordering.into();
+            let Ok(column_name) = x.column_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let table_name = match x.table_name {
+                FFIOption::None => None,
+                FFIOption::Some(v) => {
+                    let Ok(tn) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(tn)
+                }
+            };
+
+            order_by_vec.push(OrderByEntry {
+                ordering,
+                table_name,
+                column_name,
+            })
+        }
+    }
+
+    let fut = async move {
+        let join_vec: Vec<JoinTable> = join_tuple
+            .iter()
+            .map(|(a, b, c, d)| JoinTable {
+                join_type: *a,
+                table_name: b,
+                join_alias: c,
+                join_condition: d,
+            })
+            .collect();
+        match cond {
+            None => {
+                match db
+                    .query_optional(
+                        model_conv.unwrap(),
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        None,
+                        &order_by_vec,
+                        offset,
+                        transaction,
+                    )
+                    .await
+                {
+                    Ok(v) => match v {
+                        None => {
+                            unsafe { cb(context, None, Error::NoError) };
+                        }
+                        Some(row) => {
+                            unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                        }
+                    },
+                    Err(err) => {
+                        let ffi_str = err.to_string();
+                        unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) };
+                    }
+                };
+            }
+            Some(c) => match db
+                .query_optional(
+                    model_conv.unwrap(),
+                    column_vec.as_slice(),
+                    join_vec.as_slice(),
+                    Some(&c),
+                    &order_by_vec,
+                    offset,
+                    transaction,
+                )
+                .await
+            {
+                Ok(v) => match v {
+                    None => {
+                        unsafe { cb(context, None, Error::NoError) };
+                    }
+                    Some(row) => {
+                        unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                    }
+                },
                 Err(err) => {
                     let ffi_str = err.to_string();
                     unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) }
@@ -557,12 +926,15 @@ specify a null pointer.
 - `transaction`: Mutable pointer to a Transaction. Can be a null pointer to ignore this parameter.
 - `model`: Name of the table to query.
 - `columns`: Array of columns to retrieve from the database.
+- `joins`: Array of joins to add to the query.
 - `condition`: Pointer to a [Condition].
+- `order_by`: Array of [FFIOrderByEntry].
+- `limit`: Optional limit / offset to set to the query.
 - `callback`: callback function. Takes the `context`, a FFISlice of rows and an [Error].
 - `context`: Pass through void pointer.
 
 **Important**:
-- Make sure that `db`, `model`, `columns` and `condition` are
+- Make sure that `db`, `model`, `columns`, `joins` and `condition` are
 allocated until the callback is executed.
 - The FFISlice returned in the callback is freed after the callback has ended.
 
@@ -573,9 +945,12 @@ pub extern "C" fn rorm_db_query_all(
     db: &'static Database,
     transaction: Option<&'static mut Transaction>,
     model: FFIString<'static>,
-    columns: FFISlice<'static, FFIString<'static>>,
-    condition: Option<&'static Condition>,
-    callback: Option<unsafe extern "C" fn(VoidPtr, FFISlice<Row>, Error) -> ()>,
+    columns: FFISlice<'static, FFIColumnSelector<'static>>,
+    joins: FFISlice<'static, FFIJoin<'static>>,
+    condition: Option<&'static FFICondition>,
+    order_by: FFISlice<'static, FFIOrderByEntry<'static>>,
+    limit: FFIOption<FFILimitClause>,
+    callback: Option<unsafe extern "C" fn(VoidPtr, FFISlice<&Row>, Error) -> ()>,
     context: VoidPtr,
 ) {
     let cb = callback.expect("Callback must not be null");
@@ -586,16 +961,81 @@ pub extern "C" fn rorm_db_query_all(
         return;
     }
 
+    let limit = limit.into();
+
     let mut column_vec = vec![];
     {
-        let column_slice: &[FFIString] = columns.into();
-        for &x in column_slice {
-            let x_conv = x.try_into();
-            if x_conv.is_err() {
+        let column_slice: &[FFIColumnSelector] = columns.into();
+        for x in column_slice {
+            let table_name_conv: Option<FFIString> = (&x.table_name).into();
+            let table_name = match table_name_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            let Ok(column_name) = x.column_name.try_into() else {
                 unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
                 return;
-            }
-            column_vec.push(x_conv.unwrap());
+            };
+
+            let select_alias_conv: Option<FFIString> = (&x.select_alias).into();
+            let select_alias = match select_alias_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            column_vec.push(ColumnSelector {
+                table_name,
+                column_name,
+                select_alias,
+            });
+        }
+    }
+
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    {
+        let join_slice: &[FFIJoin] = joins.into();
+        for x in join_slice {
+            let join_type = x.join_type.into();
+
+            let Ok(table_name) = x.table_name.try_into() else {
+                unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                return;
+            };
+
+            let Ok(join_alias) = x.join_alias.try_into() else {
+                unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                return;
+            };
+
+            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
+            {
+                Err(err) => match err {
+                    Error::InvalidStringError
+                    | Error::InvalidDateError
+                    | Error::InvalidTimeError
+                    | Error::InvalidDateTimeError => {
+                        unsafe { cb(context, FFISlice::empty(), err) };
+                        return;
+                    }
+                    _ => unreachable!("This error should never occur"),
+                },
+                Ok(v) => v,
+            };
+
+            join_tuple.push((join_type, table_name, join_alias, join_condition));
         }
     }
 
@@ -618,13 +1058,54 @@ pub extern "C" fn rorm_db_query_all(
         None
     };
 
+    let mut order_by_vec = vec![];
+    {
+        let order_by_slice: &[FFIOrderByEntry] = order_by.into();
+        for x in order_by_slice {
+            let ordering = x.ordering.into();
+            let Ok(column_name) = x.column_name.try_into() else {
+                unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                return;
+            };
+
+            let table_name = match x.table_name {
+                FFIOption::None => None,
+                FFIOption::Some(v) => {
+                    let Ok(tn) = v.try_into() else {
+                        unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(tn)
+                }
+            };
+
+            order_by_vec.push(OrderByEntry {
+                ordering,
+                table_name,
+                column_name,
+            })
+        }
+    }
+
     let fut = async move {
+        let join_vec: Vec<JoinTable> = join_tuple
+            .iter()
+            .map(|(a, b, c, d)| JoinTable {
+                join_type: *a,
+                table_name: b,
+                join_alias: c,
+                join_condition: d,
+            })
+            .collect();
         let query_res = match cond {
             None => {
                 db.query_all(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
+                    join_vec.as_slice(),
                     None,
+                    &order_by_vec,
+                    limit,
                     transaction,
                 )
                 .await
@@ -633,7 +1114,10 @@ pub extern "C" fn rorm_db_query_all(
                 db.query_all(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
+                    join_vec.as_slice(),
                     Some(&cond),
+                    &order_by_vec,
+                    limit,
                     transaction,
                 )
                 .await
@@ -641,7 +1125,8 @@ pub extern "C" fn rorm_db_query_all(
         };
         match query_res {
             Ok(res) => {
-                let slice = res.as_slice().into();
+                let rows: Vec<&Row> = res.iter().collect();
+                let slice = rows.as_slice().into();
                 unsafe { cb(context, slice, Error::NoError) };
             }
             Err(err) => {
@@ -683,7 +1168,10 @@ Returns a pointer to the created stream.
 - `transaction`: Mutable pointer to a Transaction. Can be a null pointer to ignore this parameter.
 - `model`: Name of the table to query.
 - `columns`: Array of columns to retrieve from the database.
+- `joins`: Array of joins to add to the query.
 - `condition`: Pointer to a [Condition].
+- `order_by`: Array of [FFIOrderByEntry].
+- `limit`: Optional limit / offset to set to the query.
 - `callback`: callback function. Takes the `context`, a stream pointer and an [Error].
 - `context`: Pass through void pointer.
 
@@ -694,8 +1182,11 @@ pub extern "C" fn rorm_db_query_stream(
     db: &Database,
     transaction: Option<&'static mut Transaction>,
     model: FFIString,
-    columns: FFISlice<FFIString>,
-    condition: Option<&Condition>,
+    columns: FFISlice<FFIColumnSelector>,
+    joins: FFISlice<'static, FFIJoin<'static>>,
+    condition: Option<&FFICondition>,
+    order_by: FFISlice<'static, FFIOrderByEntry<'static>>,
+    limit: FFIOption<FFILimitClause>,
     callback: Option<unsafe extern "C" fn(VoidPtr, Option<Box<Stream>>, Error) -> ()>,
     context: VoidPtr,
 ) {
@@ -707,22 +1198,131 @@ pub extern "C" fn rorm_db_query_stream(
         return;
     }
 
-    let column_slice: &[FFIString] = columns.into();
+    let limit = limit.into();
+
     let mut column_vec = vec![];
-    for &x in column_slice {
-        let x_conv = x.try_into();
-        if x_conv.is_err() {
-            unsafe { cb(context, None, Error::InvalidStringError) };
-            return;
+    {
+        let column_slice: &[FFIColumnSelector] = columns.into();
+        for x in column_slice {
+            let table_name_conv: Option<FFIString> = (&x.table_name).into();
+            let table_name = match table_name_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            let Ok(column_name) = x.column_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let select_alias_conv: Option<FFIString> = (&x.select_alias).into();
+            let select_alias = match select_alias_conv {
+                None => None,
+                Some(v) => {
+                    let Ok(s) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(s)
+                }
+            };
+
+            column_vec.push(ColumnSelector {
+                table_name,
+                column_name,
+                select_alias,
+            });
         }
-        column_vec.push(x_conv.unwrap());
+    }
+
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    {
+        let join_slice: &[FFIJoin] = joins.into();
+        for x in join_slice {
+            let join_type = x.join_type.into();
+
+            let Ok(table_name) = x.table_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let Ok(join_alias) = x.join_alias.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
+            {
+                Err(err) => match err {
+                    Error::InvalidStringError
+                    | Error::InvalidDateError
+                    | Error::InvalidTimeError
+                    | Error::InvalidDateTimeError => {
+                        unsafe { cb(context, None, err) };
+                        return;
+                    }
+                    _ => unreachable!("This error should never occur"),
+                },
+                Ok(v) => v,
+            };
+
+            join_tuple.push((join_type, table_name, join_alias, join_condition));
+        }
+    }
+
+    let join_vec: Vec<JoinTable> = join_tuple
+        .iter()
+        .map(|(a, b, c, d)| JoinTable {
+            join_type: *a,
+            table_name: b,
+            join_alias: c,
+            join_condition: d,
+        })
+        .collect();
+
+    let mut order_by_vec = vec![];
+    {
+        let order_by_slice: &[FFIOrderByEntry] = order_by.into();
+        for x in order_by_slice {
+            let ordering = x.ordering.into();
+            let Ok(column_name) = x.column_name.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+
+            let table_name = match x.table_name {
+                FFIOption::None => None,
+                FFIOption::Some(v) => {
+                    let Ok(tn) = v.try_into() else {
+                        unsafe { cb(context, None, Error::InvalidStringError) };
+                        return;
+                    };
+                    Some(tn)
+                }
+            };
+
+            order_by_vec.push(OrderByEntry {
+                ordering,
+                table_name,
+                column_name,
+            })
+        }
     }
 
     let query_stream = match condition {
         None => db.query_stream(
             model_conv.unwrap(),
             column_vec.as_slice(),
+            join_vec.as_slice(),
             None,
+            &order_by_vec,
+            limit,
             transaction,
         ),
         Some(c) => {
@@ -742,7 +1342,10 @@ pub extern "C" fn rorm_db_query_stream(
             db.query_stream(
                 model_conv.unwrap(),
                 column_vec.as_slice(),
+                join_vec.as_slice(),
                 Some(&cond_conv.unwrap()),
+                &order_by_vec,
+                limit,
                 transaction,
             )
         }
@@ -840,7 +1443,7 @@ pub extern "C" fn rorm_db_delete(
     db: &'static Database,
     transaction: Option<&'static mut Transaction>,
     model: FFIString<'static>,
-    condition: Option<&'static Condition>,
+    condition: Option<&'static FFICondition>,
     callback: Option<unsafe extern "C" fn(VoidPtr, u64, Error) -> ()>,
     context: VoidPtr,
 ) {
@@ -1148,7 +1751,7 @@ pub extern "C" fn rorm_db_update(
     transaction: Option<&'static mut Transaction>,
     model: FFIString<'static>,
     updates: FFISlice<'static, FFIUpdate<'static>>,
-    condition: Option<&'static Condition>,
+    condition: Option<&'static FFICondition>,
     callback: Option<unsafe extern "C" fn(VoidPtr, u64, Error) -> ()>,
     context: VoidPtr,
 ) {
@@ -1419,7 +2022,7 @@ pub extern "C" fn rorm_row_get_time(
     error_ptr: &mut Error,
 ) -> FFITime {
     get_data_from_row(
-        chrono::NaiveTime::from_hms(0, 0, 0),
+        chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         row_ptr,
         index,
         error_ptr,
@@ -1443,7 +2046,10 @@ pub extern "C" fn rorm_row_get_datetime(
     error_ptr: &mut Error,
 ) -> FFIDateTime {
     get_data_from_row(
-        chrono::NaiveDateTime::new(chrono::NaiveDate::MAX, chrono::NaiveTime::from_hms(0, 0, 0)),
+        chrono::NaiveDateTime::new(
+            chrono::NaiveDate::MAX,
+            chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        ),
         row_ptr,
         index,
         error_ptr,
