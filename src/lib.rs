@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::StreamExt;
+use rorm_db::aggregation::SelectAggregator;
 use rorm_db::database::{ColumnSelector, JoinTable};
 use rorm_db::join_table::JoinType;
 use rorm_db::ordering::OrderByEntry;
@@ -514,10 +515,13 @@ pub extern "C" fn rorm_db_query_one(
                 }
             };
 
+            let aggregation: Option<SelectAggregator> = x.aggregation.into();
+
             column_vec.push(ColumnSelector {
                 table_name,
                 column_name,
                 select_alias,
+                aggregation,
             });
         }
     }
@@ -748,10 +752,13 @@ pub extern "C" fn rorm_db_query_optional(
                 }
             };
 
+            let aggregation: Option<SelectAggregator> = x.aggregation.into();
+
             column_vec.push(ColumnSelector {
                 table_name,
                 column_name,
                 select_alias,
+                aggregation,
             });
         }
     }
@@ -996,10 +1003,13 @@ pub extern "C" fn rorm_db_query_all(
                 }
             };
 
+            let aggregation: Option<SelectAggregator> = x.aggregation.into();
+
             column_vec.push(ColumnSelector {
                 table_name,
                 column_name,
                 select_alias,
+                aggregation,
             });
         }
     }
@@ -1233,10 +1243,13 @@ pub extern "C" fn rorm_db_query_stream(
                 }
             };
 
+            let aggregation: Option<SelectAggregator> = x.aggregation.into();
+
             column_vec.push(ColumnSelector {
                 table_name,
                 column_name,
                 select_alias,
+                aggregation,
             });
         }
     }

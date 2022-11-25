@@ -4,10 +4,11 @@ use std::str::{from_utf8, Utf8Error};
 
 use chrono::{Datelike, Timelike};
 use futures::stream::BoxStream;
+use rorm_db::aggregation::SelectAggregator;
 use rorm_db::limit_clause::LimitClause;
 use rorm_db::Row;
 
-use crate::representations::FFILimitClause;
+use crate::representations::{FFIAggregation, FFILimitClause};
 use crate::Error;
 
 /**
@@ -248,6 +249,7 @@ ffi_opt_impl!(chrono::NaiveDate, FFIDate);
 ffi_opt_impl!(chrono::NaiveDateTime, FFIDateTime);
 
 opt_ffi_impl!(FFILimitClause, LimitClause);
+opt_ffi_impl!(FFIAggregation, SelectAggregator);
 
 impl<T> From<Option<T>> for FFIOption<T> {
     fn from(option: Option<T>) -> Self {

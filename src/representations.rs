@@ -1,3 +1,4 @@
+use rorm_db::aggregation::SelectAggregator;
 use rorm_db::join_table::JoinType;
 use rorm_db::limit_clause::LimitClause;
 use rorm_db::ordering::Ordering;
@@ -536,6 +537,7 @@ pub struct FFIColumnSelector<'a> {
     pub(crate) table_name: FFIOption<FFIString<'a>>,
     pub(crate) column_name: FFIString<'a>,
     pub(crate) select_alias: FFIOption<FFIString<'a>>,
+    pub(crate) aggregation: FFIOption<FFIAggregation>,
 }
 
 /**
@@ -555,6 +557,41 @@ impl From<FFIOrdering> for Ordering {
         match v {
             FFIOrdering::Asc => Self::Asc,
             FFIOrdering::Desc => Self::Desc,
+        }
+    }
+}
+
+/**
+Representation of an aggregator function
+*/
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub enum FFIAggregation {
+    /// Returns the average value of all non-null values.
+    /// The result of avg is a floating point value, except all input values are null, than the
+    /// result will also be null.
+    Avg,
+    /// Returns the count of the number of times that the column is not null.
+    Count,
+    /// Returns the summary off all non-null values in the group.
+    /// If there are only null values in the group, this function will return null.
+    Sum,
+    /// Returns the maximum value of all values in the group.
+    /// If there are only null values in the group, this function will return null.
+    Max,
+    /// Returns the minimum value of all values in the group.
+    /// If there are only null values in the group, this function will return null.
+    Min,
+}
+
+impl From<FFIAggregation> for SelectAggregator {
+    fn from(v: FFIAggregation) -> Self {
+        match v {
+            FFIAggregation::Avg => SelectAggregator::Avg,
+            FFIAggregation::Count => SelectAggregator::Count,
+            FFIAggregation::Sum => SelectAggregator::Sum,
+            FFIAggregation::Max => SelectAggregator::Max,
+            FFIAggregation::Min => SelectAggregator::Min,
         }
     }
 }
