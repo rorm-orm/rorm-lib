@@ -14,6 +14,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use rorm_db::aggregation::SelectAggregator;
 use rorm_db::database::{ColumnSelector, JoinTable};
+use rorm_db::executor;
 use rorm_db::join_table::JoinType;
 use rorm_db::ordering::OrderByEntry;
 use rorm_db::row::Row;
@@ -622,7 +623,7 @@ pub extern "C" fn rorm_db_query_one(
         match cond {
             None => {
                 match db
-                    .query_one(
+                    .query::<executor::One>(
                         model_conv.unwrap(),
                         column_vec.as_slice(),
                         join_vec.as_slice(),
@@ -641,7 +642,7 @@ pub extern "C" fn rorm_db_query_one(
                 };
             }
             Some(c) => match db
-                .query_one(
+                .query::<executor::One>(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
                     join_vec.as_slice(),
@@ -859,7 +860,7 @@ pub extern "C" fn rorm_db_query_optional(
         match cond {
             None => {
                 match db
-                    .query_optional(
+                    .query::<executor::Optional>(
                         model_conv.unwrap(),
                         column_vec.as_slice(),
                         join_vec.as_slice(),
@@ -885,7 +886,7 @@ pub extern "C" fn rorm_db_query_optional(
                 };
             }
             Some(c) => match db
-                .query_optional(
+                .query::<executor::Optional>(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
                     join_vec.as_slice(),
@@ -1109,7 +1110,7 @@ pub extern "C" fn rorm_db_query_all(
             .collect();
         let query_res = match cond {
             None => {
-                db.query_all(
+                db.query::<executor::All>(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
                     join_vec.as_slice(),
@@ -1121,7 +1122,7 @@ pub extern "C" fn rorm_db_query_all(
                 .await
             }
             Some(cond) => {
-                db.query_all(
+                db.query::<executor::All>(
                     model_conv.unwrap(),
                     column_vec.as_slice(),
                     join_vec.as_slice(),
@@ -1329,7 +1330,7 @@ pub extern "C" fn rorm_db_query_stream(
     }
 
     let query_stream = match condition {
-        None => db.query_stream(
+        None => db.query::<executor::Stream>(
             model_conv.unwrap(),
             column_vec.as_slice(),
             join_vec.as_slice(),
@@ -1352,7 +1353,7 @@ pub extern "C" fn rorm_db_query_stream(
                 }
                 return;
             }
-            db.query_stream(
+            db.query::<executor::Stream>(
                 model_conv.unwrap(),
                 column_vec.as_slice(),
                 join_vec.as_slice(),
@@ -1363,7 +1364,13 @@ pub extern "C" fn rorm_db_query_stream(
             )
         }
     };
-    unsafe { cb(context, Some(Box::new(query_stream)), Error::NoError) }
+    unsafe {
+        cb(
+            context,
+            Some(Box::new(query_stream.boxed())),
+            Error::NoError,
+        )
+    }
 }
 
 /**
