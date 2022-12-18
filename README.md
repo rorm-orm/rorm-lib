@@ -1,8 +1,8 @@
 # rorm-lib
 
 ![license](https://img.shields.io/github/license/rorm-orm/rorm-lib?label=License)
-![crates-io-version](https://img.shields.io/crates/v/rorm-lib)
-![docs](https://img.shields.io/docsrs/rorm-lib?label=Docs)
+[![crates-io-version](https://img.shields.io/crates/v/rorm-lib)](https://crates.io/crates/rorm-lib)
+[![docs](https://img.shields.io/docsrs/rorm-lib?label=Docs)](https://docs.rs/rorm-lib/latest/rorm/)
 
 `rorm-lib` provides FFI bindings for [rorm-db](https://github.com/rorm-orm/rorm-db).
 
