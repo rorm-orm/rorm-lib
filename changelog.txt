@@ -1,0 +1,5 @@
+Since 0.3.0
+-----------
+
+- Added insert_returning
+- Added insert_bulk_returning
