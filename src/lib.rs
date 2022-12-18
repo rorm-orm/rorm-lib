@@ -1542,6 +1542,257 @@ pub extern "C" fn rorm_row_free(_: Box<Row>) {}
 // --------
 
 /**
+This functions inserts a row into the database while returning the requested columns.
+
+**Parameter**:
+- `db`: Reference tot he Database, provided by [rorm_db_connect]
+- `transaction`: Mutable pointer to a Transaction. Can be a null pointer to ignore this parameter.
+- `model`: Name of the table to query.
+- `columns`: Array of columns to insert to the table.
+- `row`: List of values to insert. Must be of the same length as `columns`.
+- `returning`: Array of column to return after for the insert operation.
+- `callback`: callback function. Takes the `context` a pointer to a row and an [Error].
+- `context`: Pass through void pointer.
+
+**Important**:
+- Make sure that `db`, `model`, `columns`, `row` and `returning` are allocated until the callback is executed.
+- The Row that is returned in the callback is freed after the callback has ended.
+
+This function is called from an asynchronous context.
+*/
+#[no_mangle]
+pub extern "C" fn rorm_db_insert_returning(
+    db: &'static Database,
+    transaction: Option<&'static mut Transaction>,
+    model: FFIString<'static>,
+    columns: FFISlice<'static, FFIString<'static>>,
+    row: FFISlice<'static, FFIValue<'static>>,
+    returning: FFISlice<'static, FFIString<'static>>,
+    callback: Option<unsafe extern "C" fn(VoidPtr, Option<Box<Row>>, Error) -> ()>,
+    context: VoidPtr,
+) {
+    let cb = callback.expect("Callback must not be empty");
+
+    let Ok(model) = model.try_into() else {
+        unsafe { cb(context, None, Error::InvalidStringError) };
+        return;
+    };
+
+    let mut column_vec = vec![];
+    {
+        let column_slice: &[FFIString] = columns.into();
+        for &x in column_slice {
+            let Ok(v) = x.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+            column_vec.push(v);
+        }
+    }
+
+    let mut value_vec = vec![];
+    {
+        let value_slice: &[FFIValue] = row.into();
+        for x in value_slice {
+            let x_conv = x.try_into();
+            if x_conv.is_err() {
+                match x_conv.as_ref().err().unwrap() {
+                    Error::InvalidStringError
+                    | Error::InvalidDateError
+                    | Error::InvalidTimeError
+                    | Error::InvalidDateTimeError => unsafe {
+                        cb(context, None, x_conv.err().unwrap())
+                    },
+                    _ => {}
+                }
+                return;
+            }
+            value_vec.push(x_conv.unwrap());
+        }
+    }
+
+    let mut returning_vec = vec![];
+    {
+        let returning_slice: &[FFIString] = returning.into();
+        for x in returning_slice {
+            let Ok(v) = x.try_into() else {
+                unsafe { cb(context, None, Error::InvalidStringError) };
+                return;
+            };
+            returning_vec.push(v);
+        }
+    }
+
+    let fut = async move {
+        match db
+            .insert_returning(
+                model,
+                column_vec.as_slice(),
+                value_vec.as_slice(),
+                transaction,
+                returning_vec.as_slice(),
+            )
+            .await
+        {
+            Err(err) => unsafe {
+                cb(
+                    context,
+                    None,
+                    Error::DatabaseError(err.to_string().as_str().into()),
+                )
+            },
+            Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+        };
+    };
+
+    let f = |err: String| {
+        unsafe { cb(context, None, Error::RuntimeError(err.as_str().into())) };
+    };
+    spawn_fut!(fut, cb(context, None, Error::MissingRuntimeError), f);
+}
+
+/**
+This function inserts multiple rows into the database while returning the requested columns from all
+inserted values.
+
+**Parameter**:
+- `db`: Reference to the Database, provided by [rorm_db_connect].
+- `transaction`: Mutable pointer to a Transaction. Can be a null pointer to ignore this parameter.
+- `model`: Name of the table to query.
+- `columns`: Array of columns to insert to the table.
+- `rows`: List of list of values to insert. The inner lists must be of the same length as `columns`.
+- `returning`: Array of column to return after for the insert operation.
+- `callback`: callback function. Takes the `context` and an [Error].
+- `context`: Pass through void pointer.
+
+**Important**:
+- Make sure that `db`, `model`, `columns`, `rows` and `returning` are allocated until the callback is executed.
+- The FFISlice returned in the callback is freed after the callback has ended.
+
+This function is called from an asynchronous context.
+ */
+#[no_mangle]
+pub extern "C" fn rorm_db_insert_bulk_returning(
+    db: &'static Database,
+    transaction: Option<&'static mut Transaction>,
+    model: FFIString<'static>,
+    columns: FFISlice<'static, FFIString<'static>>,
+    rows: FFISlice<'static, FFISlice<'static, FFIValue<'static>>>,
+    returning: FFISlice<'static, FFIString<'static>>,
+    callback: Option<unsafe extern "C" fn(VoidPtr, FFISlice<&Row>, Error) -> ()>,
+    context: VoidPtr,
+) {
+    let cb = callback.expect("Callback must not be empty");
+
+    let model_conv = model.try_into();
+    if model_conv.is_err() {
+        unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+        return;
+    }
+    let model = model_conv.unwrap();
+
+    let mut column_vec = vec![];
+    {
+        let column_slice: &[FFIString] = columns.into();
+        for &x in column_slice {
+            let x_conv = x.try_into();
+            if x_conv.is_err() {
+                unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
+                return;
+            }
+            column_vec.push(x_conv.unwrap());
+        }
+    }
+
+    let mut rows_vec = vec![];
+    {
+        let row_slices: &[FFISlice<FFIValue>] = rows.into();
+        for row in row_slices {
+            let mut row_vec = vec![];
+            let row_slice: &[FFIValue] = row.into();
+            for x in row_slice {
+                let val = x.try_into();
+                if val.is_err() {
+                    match val.as_ref().err().unwrap() {
+                        Error::InvalidStringError
+                        | Error::InvalidDateError
+                        | Error::InvalidTimeError
+                        | Error::InvalidDateTimeError => unsafe {
+                            cb(context, FFISlice::empty(), val.err().unwrap())
+                        },
+                        _ => {}
+                    }
+                    return;
+                }
+                row_vec.push(val.unwrap());
+            }
+            rows_vec.push(row_vec);
+        }
+    }
+
+    let mut returning_vec = vec![];
+    {
+        let returning_slice: &[FFIString] = returning.into();
+        for x in returning_slice {
+            let Ok(v) = x.try_into() else {
+                unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError )}
+                return;
+            };
+
+            returning_vec.push(v);
+        }
+    }
+
+    let fut = async move {
+        match db
+            .insert_bulk_returning(
+                model,
+                column_vec.as_slice(),
+                rows_vec
+                    .iter()
+                    .map(|x| x.as_slice())
+                    .collect::<Vec<&[Value]>>()
+                    .as_slice(),
+                transaction,
+                returning_vec.as_slice(),
+            )
+            .await
+        {
+            Ok(v) => {
+                let rows: Vec<&Row> = v.iter().collect();
+                let slice = rows.as_slice().into();
+                unsafe { cb(context, slice, Error::NoError) }
+            }
+            Err(err) => {
+                let ffi_str = err.to_string();
+                unsafe {
+                    cb(
+                        context,
+                        FFISlice::empty(),
+                        Error::DatabaseError(ffi_str.as_str().into()),
+                    )
+                };
+            }
+        }
+    };
+
+    let f = |err: String| {
+        unsafe {
+            cb(
+                context,
+                FFISlice::empty(),
+                Error::RuntimeError(err.as_str().into()),
+            )
+        };
+    };
+    spawn_fut!(
+        fut,
+        cb(context, FFISlice::empty(), Error::MissingRuntimeError),
+        f
+    );
+}
+
+/**
 This function inserts a row into the database.
 
 **Parameter**:
