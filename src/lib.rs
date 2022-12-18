@@ -160,10 +160,7 @@ pub extern "C" fn rorm_db_connect(
 
     let fut = async move {
         match Database::connect(db_options).await {
-            Ok(db) => {
-                let b = Box::new(db);
-                unsafe { cb(context, Some(b), Error::NoError) }
-            }
+            Ok(db) => unsafe { cb(context, Some(Box::new(db)), Error::NoError) },
             Err(e) => {
                 let error = e.to_string();
                 unsafe {
@@ -367,33 +364,27 @@ pub extern "C" fn rorm_db_raw_sql(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let query_str = query_string.try_into();
-    if query_str.is_err() {
+    let Ok(query_str) = query_string.try_into() else {
         unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
         return;
-    }
+    };
 
     let bind_params = {
         let ffi_slice: &[FFIValue] = bind_params.into();
         let mut values: Vec<Value> = vec![];
         for x in ffi_slice {
-            if let Ok(value) = x.try_into() {
-                values.push(value);
-            } else {
+            let Ok(v) = x.try_into() else {
                 unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
                 return;
-            }
+            };
+            values.push(v);
         }
         values
     };
 
     let fut = async move {
         let query_res = db
-            .raw_sql(
-                query_str.unwrap(),
-                Some(bind_params.as_slice()),
-                transaction,
-            )
+            .raw_sql(query_str, Some(bind_params.as_slice()), transaction)
             .await;
 
         match query_res {
@@ -475,11 +466,10 @@ pub extern "C" fn rorm_db_query_one(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model_conv) = model.try_into() else {
         unsafe { cb(context, None, Error::InvalidStringError) };
         return;
-    }
+    };
 
     let offset = offset.into();
 
@@ -624,7 +614,7 @@ pub extern "C" fn rorm_db_query_one(
             None => {
                 match db
                     .query::<executor::One>(
-                        model_conv.unwrap(),
+                        model_conv,
                         column_vec.as_slice(),
                         join_vec.as_slice(),
                         None,
@@ -643,7 +633,7 @@ pub extern "C" fn rorm_db_query_one(
             }
             Some(c) => match db
                 .query::<executor::One>(
-                    model_conv.unwrap(),
+                    model_conv,
                     column_vec.as_slice(),
                     join_vec.as_slice(),
                     Some(&c),
@@ -712,11 +702,10 @@ pub extern "C" fn rorm_db_query_optional(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model_conv) = model.try_into() else {
         unsafe { cb(context, None, Error::InvalidStringError) };
         return;
-    }
+    };
 
     let offset = offset.into();
 
@@ -861,7 +850,7 @@ pub extern "C" fn rorm_db_query_optional(
             None => {
                 match db
                     .query::<executor::Optional>(
-                        model_conv.unwrap(),
+                        model_conv,
                         column_vec.as_slice(),
                         join_vec.as_slice(),
                         None,
@@ -887,7 +876,7 @@ pub extern "C" fn rorm_db_query_optional(
             }
             Some(c) => match db
                 .query::<executor::Optional>(
-                    model_conv.unwrap(),
+                    model_conv,
                     column_vec.as_slice(),
                     join_vec.as_slice(),
                     Some(&c),
@@ -963,11 +952,10 @@ pub extern "C" fn rorm_db_query_all(
 ) {
     let cb = callback.expect("Callback must not be null");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model_conv) = model.try_into() else {
         unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
         return;
-    }
+    };
 
     let limit = limit.into();
 
@@ -1111,7 +1099,7 @@ pub extern "C" fn rorm_db_query_all(
         let query_res = match cond {
             None => {
                 db.query::<executor::All>(
-                    model_conv.unwrap(),
+                    model_conv,
                     column_vec.as_slice(),
                     join_vec.as_slice(),
                     None,
@@ -1123,7 +1111,7 @@ pub extern "C" fn rorm_db_query_all(
             }
             Some(cond) => {
                 db.query::<executor::All>(
-                    model_conv.unwrap(),
+                    model_conv,
                     column_vec.as_slice(),
                     join_vec.as_slice(),
                     Some(&cond),
@@ -1203,11 +1191,10 @@ pub extern "C" fn rorm_db_query_stream(
 ) {
     let cb = callback.expect("Callback must not be null");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model_conv) = model.try_into() else {
         unsafe { cb(context, None, Error::InvalidStringError) };
         return;
-    }
+    };
 
     let limit = limit.into();
 
@@ -1331,7 +1318,7 @@ pub extern "C" fn rorm_db_query_stream(
 
     let query_stream = match condition {
         None => db.query::<executor::Stream>(
-            model_conv.unwrap(),
+            model_conv,
             column_vec.as_slice(),
             join_vec.as_slice(),
             None,
@@ -1354,7 +1341,7 @@ pub extern "C" fn rorm_db_query_stream(
                 return;
             }
             db.query::<executor::Stream>(
-                model_conv.unwrap(),
+                model_conv,
                 column_vec.as_slice(),
                 join_vec.as_slice(),
                 Some(&cond_conv.unwrap()),
@@ -1469,11 +1456,10 @@ pub extern "C" fn rorm_db_delete(
 ) {
     let cb = callback.expect("Callback must not be null");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model_conv) = model.try_into() else {
         unsafe { cb(context, u64::MAX, Error::InvalidStringError) };
         return;
-    }
+    };
 
     let cond = if let Some(cond) = condition {
         let cond_conv = cond.try_into();
@@ -1496,7 +1482,7 @@ pub extern "C" fn rorm_db_delete(
 
     let fut = async move {
         match cond {
-            None => match db.delete(model_conv.unwrap(), None, transaction).await {
+            None => match db.delete(model_conv, None, transaction).await {
                 Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
                 Err(err) => {
                     let ffi_err = err.to_string();
@@ -1509,7 +1495,7 @@ pub extern "C" fn rorm_db_delete(
                     };
                 }
             },
-            Some(v) => match db.delete(model_conv.unwrap(), Some(&v), transaction).await {
+            Some(v) => match db.delete(model_conv, Some(&v), transaction).await {
                 Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
                 Err(err) => {
                     let ffi_err = err.to_string();
@@ -1691,23 +1677,20 @@ pub extern "C" fn rorm_db_insert_bulk_returning(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model) = model.try_into() else {
         unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
         return;
-    }
-    let model = model_conv.unwrap();
+    };
 
     let mut column_vec = vec![];
     {
         let column_slice: &[FFIString] = columns.into();
         for &x in column_slice {
-            let x_conv = x.try_into();
-            if x_conv.is_err() {
+            let Ok(v) = x.try_into() else {
                 unsafe { cb(context, FFISlice::empty(), Error::InvalidStringError) };
                 return;
-            }
-            column_vec.push(x_conv.unwrap());
+            };
+            column_vec.push(v);
         }
     }
 
@@ -1828,23 +1811,20 @@ pub extern "C" fn rorm_db_insert(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model) = model.try_into() else {
         unsafe { cb(context, Error::InvalidStringError) };
         return;
-    }
-    let model = model_conv.unwrap();
+    };
 
     let mut column_vec = vec![];
     {
         let column_slice: &[FFIString] = columns.into();
         for &x in column_slice {
-            let x_conv = x.try_into();
-            if x_conv.is_err() {
+            let Ok(v) = x.try_into() else {
                 unsafe { cb(context, Error::InvalidStringError) };
                 return;
-            }
-            column_vec.push(x_conv.unwrap());
+            };
+            column_vec.push(v);
         }
     }
 
@@ -1922,23 +1902,20 @@ pub extern "C" fn rorm_db_insert_bulk(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model) = model.try_into() else {
         unsafe { cb(context, Error::InvalidStringError) };
         return;
-    }
-    let model = model_conv.unwrap();
+    };
 
     let mut column_vec = vec![];
     {
         let column_slice: &[FFIString] = columns.into();
         for &x in column_slice {
-            let x_conv = x.try_into();
-            if x_conv.is_err() {
+            let Ok(v) = x.try_into() else {
                 unsafe { cb(context, Error::InvalidStringError) };
                 return;
-            }
-            column_vec.push(x_conv.unwrap());
+            };
+            column_vec.push(v);
         }
     }
 
@@ -2028,29 +2005,25 @@ pub extern "C" fn rorm_db_update(
 ) {
     let cb = callback.expect("Callback must not be empty");
 
-    let model_conv = model.try_into();
-    if model_conv.is_err() {
+    let Ok(model) = model.try_into() else {
         unsafe { cb(context, u64::MAX, Error::InvalidStringError) };
         return;
-    }
-    let model = model_conv.unwrap();
+    };
 
     let mut up = vec![];
     let update_slice: &[FFIUpdate] = updates.into();
     for update in update_slice {
-        let column_conv = update.column.try_into();
-        if column_conv.is_err() {
+        let Ok(column_conv) = update.column.try_into() else {
             unsafe { cb(context, u64::MAX, Error::InvalidStringError) };
             return;
-        }
+        };
 
-        let value_conv: Result<Value, Error> = (&update.value).try_into();
-        if value_conv.is_err() {
+        let Ok(value_conv) = (&update.value).try_into() else {
             unsafe { cb(context, u64::MAX, Error::InvalidStringError) };
             return;
-        }
+        };
 
-        up.push((column_conv.unwrap(), value_conv.unwrap()));
+        up.push((column_conv, value_conv));
     }
 
     let cond = if let Some(cond) = condition {
