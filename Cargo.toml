@@ -24,10 +24,10 @@ name = "rorm"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-rorm-db = { version = "~0.4", path = "rorm-db" }
+rorm-db = { version = "~0.6", path = "rorm-db", features = ["tokio-rustls"] }
 
 # Runtime to execute the async context in
-tokio = { version = "~1.23" }
+tokio = { version = "~1.23", features = ["rt-multi-thread", "macros"] }
 
 # Async wrapper
 futures = { version = "~0.3" }
@@ -36,15 +36,10 @@ futures = { version = "~0.3" }
 sqlx = { version = "~0.6" }
 
 # Date and time library
-chrono = { version = "~0.4" }
+chrono = { version = ">=0.4.20" }
 
 # Optional logging framework
 env_logger = { version = "~0.10", optional = true }
 
 [features]
-default = [
-    "rorm-db/tokio-rustls",
-    "tokio/rt-multi-thread",
-]
-
 logging = ["dep:env_logger"]
