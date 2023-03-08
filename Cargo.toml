@@ -27,7 +27,7 @@ crate-type = ["staticlib", "cdylib"]
 rorm-db = { version = "~0.6", path = "rorm-db", features = ["tokio-rustls"] }
 
 # Runtime to execute the async context in
-tokio = { version = "~1.23", features = ["rt-multi-thread", "macros"] }
+tokio = { version = ">=1.23.1", features = ["rt-multi-thread", "macros"] }
 
 # Async wrapper
 futures = { version = "~0.3" }
@@ -43,3 +43,8 @@ env_logger = { version = "~0.10", optional = true }
 
 [features]
 logging = ["dep:env_logger"]
+
+[profile.export]
+inherits = "release"
+lto = "fat"
+opt-level = "s"

@@ -12,15 +12,17 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::StreamExt;
-use rorm_db::aggregation::SelectAggregator;
-use rorm_db::database::{ColumnSelector, JoinTable};
-use rorm_db::executor;
-use rorm_db::join_table::JoinType;
-use rorm_db::ordering::OrderByEntry;
+use rorm_db::database::{
+    delete, insert, insert_bulk, insert_bulk_returning, insert_returning, query, update,
+    ColumnSelector, JoinTable,
+};
 use rorm_db::row::Row;
+use rorm_db::sql::aggregation::SelectAggregator;
+use rorm_db::sql::join_table::JoinType;
+use rorm_db::sql::ordering::OrderByEntry;
+use rorm_db::sql::value::Value;
 use rorm_db::transaction::Transaction;
-use rorm_db::value::Value;
-use rorm_db::{Database, DatabaseConfiguration};
+use rorm_db::{executor, Database, DatabaseConfiguration};
 use tokio::runtime::Runtime;
 
 use crate::errors::Error;
@@ -253,7 +255,7 @@ This function is called from an asynchronous context.
 */
 #[no_mangle]
 pub extern "C" fn rorm_transaction_commit(
-    transaction: Option<Box<Transaction<'static>>>,
+    transaction: Option<Box<Transaction>>,
     callback: Option<unsafe extern "C" fn(VoidPtr, Error) -> ()>,
     context: VoidPtr,
 ) {
@@ -294,7 +296,7 @@ This function is called from an asynchronous context.
  */
 #[no_mangle]
 pub extern "C" fn rorm_transaction_rollback(
-    transaction: Option<Box<Transaction<'static>>>,
+    transaction: Option<Box<Transaction>>,
     callback: Option<unsafe extern "C" fn(VoidPtr, Error) -> ()>,
     context: VoidPtr,
 ) {
@@ -517,7 +519,7 @@ pub extern "C" fn rorm_db_query_one(
         }
     }
 
-    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::sql::conditional::Condition)> = vec![];
     {
         let join_slice: &[FFIJoin] = joins.into();
         for x in join_slice {
@@ -533,20 +535,20 @@ pub extern "C" fn rorm_db_query_one(
                 return;
             };
 
-            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
-            {
-                Err(err) => match err {
-                    Error::InvalidStringError
-                    | Error::InvalidDateError
-                    | Error::InvalidTimeError
-                    | Error::InvalidDateTimeError => {
-                        unsafe { cb(context, None, err) };
-                        return;
-                    }
-                    _ => unreachable!("This error should never occur"),
-                },
-                Ok(v) => v,
-            };
+            let join_condition: rorm_db::sql::conditional::Condition =
+                match x.join_condition.try_into() {
+                    Err(err) => match err {
+                        Error::InvalidStringError
+                        | Error::InvalidDateError
+                        | Error::InvalidTimeError
+                        | Error::InvalidDateTimeError => {
+                            unsafe { cb(context, None, err) };
+                            return;
+                        }
+                        _ => unreachable!("This error should never occur"),
+                    },
+                    Ok(v) => v,
+                };
 
             join_tuple.push((join_type, table_name, join_alias, join_condition));
         }
@@ -612,43 +614,91 @@ pub extern "C" fn rorm_db_query_one(
             .collect();
         match cond {
             None => {
-                match db
-                    .query::<executor::One>(
+                if let Some(tx) = transaction {
+                    match query::<executor::One>(
+                        tx,
                         model_conv,
                         column_vec.as_slice(),
                         join_vec.as_slice(),
                         None,
                         &order_by_vec,
                         offset,
-                        transaction,
                     )
                     .await
-                {
-                    Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
-                    Err(err) => {
-                        let ffi_str = err.to_string();
-                        unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) };
+                    {
+                        Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            };
+                        }
+                    };
+                } else {
+                    match query::<executor::One>(
+                        db,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        None,
+                        &order_by_vec,
+                        offset,
+                    )
+                    .await
+                    {
+                        Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            };
+                        }
                     }
-                };
-            }
-            Some(c) => match db
-                .query::<executor::One>(
-                    model_conv,
-                    column_vec.as_slice(),
-                    join_vec.as_slice(),
-                    Some(&c),
-                    &order_by_vec,
-                    offset,
-                    transaction,
-                )
-                .await
-            {
-                Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
-                Err(err) => {
-                    let ffi_str = err.to_string();
-                    unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) }
                 }
-            },
+            }
+            Some(c) => {
+                if let Some(tx) = transaction {
+                    match query::<executor::One>(
+                        tx,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        Some(&c),
+                        &order_by_vec,
+                        offset,
+                    )
+                    .await
+                    {
+                        Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            }
+                        }
+                    }
+                } else {
+                    match query::<executor::One>(
+                        db,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        Some(&c),
+                        &order_by_vec,
+                        offset,
+                    )
+                    .await
+                    {
+                        Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -753,7 +803,7 @@ pub extern "C" fn rorm_db_query_optional(
         }
     }
 
-    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::sql::conditional::Condition)> = vec![];
     {
         let join_slice: &[FFIJoin] = joins.into();
         for x in join_slice {
@@ -769,20 +819,20 @@ pub extern "C" fn rorm_db_query_optional(
                 return;
             };
 
-            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
-            {
-                Err(err) => match err {
-                    Error::InvalidStringError
-                    | Error::InvalidDateError
-                    | Error::InvalidTimeError
-                    | Error::InvalidDateTimeError => {
-                        unsafe { cb(context, None, err) };
-                        return;
-                    }
-                    _ => unreachable!("This error should never occur"),
-                },
-                Ok(v) => v,
-            };
+            let join_condition: rorm_db::sql::conditional::Condition =
+                match x.join_condition.try_into() {
+                    Err(err) => match err {
+                        Error::InvalidStringError
+                        | Error::InvalidDateError
+                        | Error::InvalidTimeError
+                        | Error::InvalidDateTimeError => {
+                            unsafe { cb(context, None, err) };
+                            return;
+                        }
+                        _ => unreachable!("This error should never occur"),
+                    },
+                    Ok(v) => v,
+                };
 
             join_tuple.push((join_type, table_name, join_alias, join_condition));
         }
@@ -848,57 +898,119 @@ pub extern "C" fn rorm_db_query_optional(
             .collect();
         match cond {
             None => {
-                match db
-                    .query::<executor::Optional>(
+                if let Some(tx) = transaction {
+                    match query::<executor::Optional>(
+                        tx,
                         model_conv,
                         column_vec.as_slice(),
                         join_vec.as_slice(),
                         None,
                         &order_by_vec,
                         offset,
-                        transaction,
                     )
                     .await
-                {
-                    Ok(v) => match v {
-                        None => {
-                            unsafe { cb(context, None, Error::NoError) };
+                    {
+                        Ok(v) => match v {
+                            None => {
+                                unsafe { cb(context, None, Error::NoError) };
+                            }
+                            Some(row) => {
+                                unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                            }
+                        },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            };
                         }
-                        Some(row) => {
-                            unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                    };
+                } else {
+                    match query::<executor::Optional>(
+                        db,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        None,
+                        &order_by_vec,
+                        offset,
+                    )
+                    .await
+                    {
+                        Ok(v) => match v {
+                            None => {
+                                unsafe { cb(context, None, Error::NoError) };
+                            }
+                            Some(row) => {
+                                unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                            }
+                        },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            };
                         }
-                    },
-                    Err(err) => {
-                        let ffi_str = err.to_string();
-                        unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) };
-                    }
-                };
-            }
-            Some(c) => match db
-                .query::<executor::Optional>(
-                    model_conv,
-                    column_vec.as_slice(),
-                    join_vec.as_slice(),
-                    Some(&c),
-                    &order_by_vec,
-                    offset,
-                    transaction,
-                )
-                .await
-            {
-                Ok(v) => match v {
-                    None => {
-                        unsafe { cb(context, None, Error::NoError) };
-                    }
-                    Some(row) => {
-                        unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
-                    }
-                },
-                Err(err) => {
-                    let ffi_str = err.to_string();
-                    unsafe { cb(context, None, Error::DatabaseError(ffi_str.as_str().into())) }
+                    };
                 }
-            },
+            }
+            Some(c) => {
+                if let Some(tx) = transaction {
+                    match query::<executor::Optional>(
+                        tx,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        Some(&c),
+                        &order_by_vec,
+                        offset,
+                    )
+                    .await
+                    {
+                        Ok(v) => match v {
+                            None => {
+                                unsafe { cb(context, None, Error::NoError) };
+                            }
+                            Some(row) => {
+                                unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                            }
+                        },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            }
+                        }
+                    }
+                } else {
+                    match query::<executor::Optional>(
+                        db,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        Some(&c),
+                        &order_by_vec,
+                        offset,
+                    )
+                    .await
+                    {
+                        Ok(v) => match v {
+                            None => {
+                                unsafe { cb(context, None, Error::NoError) };
+                            }
+                            Some(row) => {
+                                unsafe { cb(context, Some(Box::new(row)), Error::NoError) };
+                            }
+                        },
+                        Err(err) => {
+                            let ffi_str = err.to_string();
+                            unsafe {
+                                cb(context, None, Error::DatabaseError(ffi_str.as_str().into()))
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
@@ -1003,7 +1115,7 @@ pub extern "C" fn rorm_db_query_all(
         }
     }
 
-    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::sql::conditional::Condition)> = vec![];
     {
         let join_slice: &[FFIJoin] = joins.into();
         for x in join_slice {
@@ -1019,20 +1131,20 @@ pub extern "C" fn rorm_db_query_all(
                 return;
             };
 
-            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
-            {
-                Err(err) => match err {
-                    Error::InvalidStringError
-                    | Error::InvalidDateError
-                    | Error::InvalidTimeError
-                    | Error::InvalidDateTimeError => {
-                        unsafe { cb(context, FFISlice::empty(), err) };
-                        return;
-                    }
-                    _ => unreachable!("This error should never occur"),
-                },
-                Ok(v) => v,
-            };
+            let join_condition: rorm_db::sql::conditional::Condition =
+                match x.join_condition.try_into() {
+                    Err(err) => match err {
+                        Error::InvalidStringError
+                        | Error::InvalidDateError
+                        | Error::InvalidTimeError
+                        | Error::InvalidDateTimeError => {
+                            unsafe { cb(context, FFISlice::empty(), err) };
+                            return;
+                        }
+                        _ => unreachable!("This error should never occur"),
+                    },
+                    Ok(v) => v,
+                };
 
             join_tuple.push((join_type, table_name, join_alias, join_condition));
         }
@@ -1098,28 +1210,54 @@ pub extern "C" fn rorm_db_query_all(
             .collect();
         let query_res = match cond {
             None => {
-                db.query::<executor::All>(
-                    model_conv,
-                    column_vec.as_slice(),
-                    join_vec.as_slice(),
-                    None,
-                    &order_by_vec,
-                    limit,
-                    transaction,
-                )
-                .await
+                if let Some(tx) = transaction {
+                    query::<executor::All>(
+                        tx,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        None,
+                        &order_by_vec,
+                        limit,
+                    )
+                    .await
+                } else {
+                    query::<executor::All>(
+                        db,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        None,
+                        &order_by_vec,
+                        limit,
+                    )
+                    .await
+                }
             }
             Some(cond) => {
-                db.query::<executor::All>(
-                    model_conv,
-                    column_vec.as_slice(),
-                    join_vec.as_slice(),
-                    Some(&cond),
-                    &order_by_vec,
-                    limit,
-                    transaction,
-                )
-                .await
+                if let Some(tx) = transaction {
+                    query::<executor::All>(
+                        tx,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        Some(&cond),
+                        &order_by_vec,
+                        limit,
+                    )
+                    .await
+                } else {
+                    query::<executor::All>(
+                        db,
+                        model_conv,
+                        column_vec.as_slice(),
+                        join_vec.as_slice(),
+                        Some(&cond),
+                        &order_by_vec,
+                        limit,
+                    )
+                    .await
+                }
             }
         };
         match query_res {
@@ -1242,7 +1380,7 @@ pub extern "C" fn rorm_db_query_stream(
         }
     }
 
-    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::conditional::Condition)> = vec![];
+    let mut join_tuple: Vec<(JoinType, &str, &str, rorm_db::sql::conditional::Condition)> = vec![];
     {
         let join_slice: &[FFIJoin] = joins.into();
         for x in join_slice {
@@ -1258,20 +1396,20 @@ pub extern "C" fn rorm_db_query_stream(
                 return;
             };
 
-            let join_condition: rorm_db::conditional::Condition = match x.join_condition.try_into()
-            {
-                Err(err) => match err {
-                    Error::InvalidStringError
-                    | Error::InvalidDateError
-                    | Error::InvalidTimeError
-                    | Error::InvalidDateTimeError => {
-                        unsafe { cb(context, None, err) };
-                        return;
-                    }
-                    _ => unreachable!("This error should never occur"),
-                },
-                Ok(v) => v,
-            };
+            let join_condition: rorm_db::sql::conditional::Condition =
+                match x.join_condition.try_into() {
+                    Err(err) => match err {
+                        Error::InvalidStringError
+                        | Error::InvalidDateError
+                        | Error::InvalidTimeError
+                        | Error::InvalidDateTimeError => {
+                            unsafe { cb(context, None, err) };
+                            return;
+                        }
+                        _ => unreachable!("This error should never occur"),
+                    },
+                    Ok(v) => v,
+                };
 
             join_tuple.push((join_type, table_name, join_alias, join_condition));
         }
@@ -1317,17 +1455,31 @@ pub extern "C" fn rorm_db_query_stream(
     }
 
     let query_stream = match condition {
-        None => db.query::<executor::Stream>(
-            model_conv,
-            column_vec.as_slice(),
-            join_vec.as_slice(),
-            None,
-            &order_by_vec,
-            limit,
-            transaction,
-        ),
+        None => {
+            if let Some(tx) = transaction {
+                query::<executor::Stream>(
+                    tx,
+                    model_conv,
+                    column_vec.as_slice(),
+                    join_vec.as_slice(),
+                    None,
+                    &order_by_vec,
+                    limit,
+                )
+            } else {
+                query::<executor::Stream>(
+                    db,
+                    model_conv,
+                    column_vec.as_slice(),
+                    join_vec.as_slice(),
+                    None,
+                    &order_by_vec,
+                    limit,
+                )
+            }
+        }
         Some(c) => {
-            let cond_conv: Result<rorm_db::conditional::Condition, Error> = c.try_into();
+            let cond_conv: Result<rorm_db::sql::conditional::Condition, Error> = c.try_into();
             if cond_conv.is_err() {
                 match cond_conv.as_ref().err().unwrap() {
                     Error::InvalidStringError
@@ -1340,15 +1492,27 @@ pub extern "C" fn rorm_db_query_stream(
                 }
                 return;
             }
-            db.query::<executor::Stream>(
-                model_conv,
-                column_vec.as_slice(),
-                join_vec.as_slice(),
-                Some(&cond_conv.unwrap()),
-                &order_by_vec,
-                limit,
-                transaction,
-            )
+            if let Some(tx) = transaction {
+                query::<executor::Stream>(
+                    tx,
+                    model_conv,
+                    column_vec.as_slice(),
+                    join_vec.as_slice(),
+                    Some(&cond_conv.unwrap()),
+                    &order_by_vec,
+                    limit,
+                )
+            } else {
+                query::<executor::Stream>(
+                    db,
+                    model_conv,
+                    column_vec.as_slice(),
+                    join_vec.as_slice(),
+                    Some(&cond_conv.unwrap()),
+                    &order_by_vec,
+                    limit,
+                )
+            }
         }
     };
     unsafe {
@@ -1482,32 +1646,68 @@ pub extern "C" fn rorm_db_delete(
 
     let fut = async move {
         match cond {
-            None => match db.delete(model_conv, None, transaction).await {
-                Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
-                Err(err) => {
-                    let ffi_err = err.to_string();
-                    unsafe {
-                        cb(
-                            context,
-                            u64::MAX,
-                            Error::DatabaseError(ffi_err.as_str().into()),
-                        )
-                    };
+            None => {
+                if let Some(tx) = transaction {
+                    match delete(tx, model_conv, None).await {
+                        Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
+                        Err(err) => {
+                            let ffi_err = err.to_string();
+                            unsafe {
+                                cb(
+                                    context,
+                                    u64::MAX,
+                                    Error::DatabaseError(ffi_err.as_str().into()),
+                                )
+                            };
+                        }
+                    }
+                } else {
+                    match delete(db, model_conv, None).await {
+                        Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
+                        Err(err) => {
+                            let ffi_err = err.to_string();
+                            unsafe {
+                                cb(
+                                    context,
+                                    u64::MAX,
+                                    Error::DatabaseError(ffi_err.as_str().into()),
+                                )
+                            };
+                        }
+                    }
                 }
-            },
-            Some(v) => match db.delete(model_conv, Some(&v), transaction).await {
-                Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
-                Err(err) => {
-                    let ffi_err = err.to_string();
-                    unsafe {
-                        cb(
-                            context,
-                            u64::MAX,
-                            Error::DatabaseError(ffi_err.as_str().into()),
-                        )
-                    };
+            }
+            Some(v) => {
+                if let Some(tx) = transaction {
+                    match delete(tx, model_conv, Some(&v)).await {
+                        Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
+                        Err(err) => {
+                            let ffi_err = err.to_string();
+                            unsafe {
+                                cb(
+                                    context,
+                                    u64::MAX,
+                                    Error::DatabaseError(ffi_err.as_str().into()),
+                                )
+                            };
+                        }
+                    }
+                } else {
+                    match delete(db, model_conv, Some(&v)).await {
+                        Ok(rows_affected) => unsafe { cb(context, rows_affected, Error::NoError) },
+                        Err(err) => {
+                            let ffi_err = err.to_string();
+                            unsafe {
+                                cb(
+                                    context,
+                                    u64::MAX,
+                                    Error::DatabaseError(ffi_err.as_str().into()),
+                                )
+                            };
+                        }
+                    }
                 }
-            },
+            }
         }
     };
 
@@ -1617,25 +1817,45 @@ pub extern "C" fn rorm_db_insert_returning(
     }
 
     let fut = async move {
-        match db
-            .insert_returning(
+        if let Some(tx) = transaction {
+            match insert_returning(
+                tx,
                 model,
                 column_vec.as_slice(),
                 value_vec.as_slice(),
-                transaction,
                 returning_vec.as_slice(),
             )
             .await
-        {
-            Err(err) => unsafe {
-                cb(
-                    context,
-                    None,
-                    Error::DatabaseError(err.to_string().as_str().into()),
-                )
-            },
-            Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
-        };
+            {
+                Err(err) => unsafe {
+                    cb(
+                        context,
+                        None,
+                        Error::DatabaseError(err.to_string().as_str().into()),
+                    )
+                },
+                Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+            };
+        } else {
+            match insert_returning(
+                db,
+                model,
+                column_vec.as_slice(),
+                value_vec.as_slice(),
+                returning_vec.as_slice(),
+            )
+            .await
+            {
+                Err(err) => unsafe {
+                    cb(
+                        context,
+                        None,
+                        Error::DatabaseError(err.to_string().as_str().into()),
+                    )
+                },
+                Ok(v) => unsafe { cb(context, Some(Box::new(v)), Error::NoError) },
+            };
+        }
     };
 
     let f = |err: String| {
@@ -1682,7 +1902,7 @@ pub extern "C" fn rorm_db_insert_bulk_returning(
         return;
     };
 
-    let mut column_vec = vec![];
+    let mut column_vec: Vec<&str> = vec![];
     {
         let column_slice: &[FFIString] = columns.into();
         for &x in column_slice {
@@ -1698,7 +1918,7 @@ pub extern "C" fn rorm_db_insert_bulk_returning(
     {
         let row_slices: &[FFISlice<FFIValue>] = rows.into();
         for row in row_slices {
-            let mut row_vec = vec![];
+            let mut row_vec: Vec<Value<'_>> = vec![];
             let row_slice: &[FFIValue] = row.into();
             for x in row_slice {
                 let val = x.try_into();
@@ -1720,7 +1940,7 @@ pub extern "C" fn rorm_db_insert_bulk_returning(
         }
     }
 
-    let mut returning_vec = vec![];
+    let mut returning_vec: Vec<&str> = vec![];
     {
         let returning_slice: &[FFIString] = returning.into();
         for x in returning_slice {
@@ -1734,8 +1954,9 @@ pub extern "C" fn rorm_db_insert_bulk_returning(
     }
 
     let fut = async move {
-        match db
-            .insert_bulk_returning(
+        if let Some(tx) = transaction {
+            match insert_bulk_returning(
+                tx,
                 model,
                 column_vec.as_slice(),
                 rows_vec
@@ -1743,26 +1964,56 @@ pub extern "C" fn rorm_db_insert_bulk_returning(
                     .map(|x| x.as_slice())
                     .collect::<Vec<&[Value]>>()
                     .as_slice(),
-                transaction,
                 returning_vec.as_slice(),
             )
             .await
-        {
-            Ok(v) => {
-                let rows: Vec<&Row> = v.iter().collect();
-                let slice = rows.as_slice().into();
-                unsafe { cb(context, slice, Error::NoError) }
-            }
-            Err(err) => {
-                let ffi_str = err.to_string();
-                unsafe {
-                    cb(
-                        context,
-                        FFISlice::empty(),
-                        Error::DatabaseError(ffi_str.as_str().into()),
-                    )
-                };
-            }
+            {
+                Ok(v) => {
+                    let rows: Vec<&Row> = v.iter().collect();
+                    let slice = rows.as_slice().into();
+                    unsafe { cb(context, slice, Error::NoError) }
+                }
+                Err(err) => {
+                    let ffi_str = err.to_string();
+                    unsafe {
+                        cb(
+                            context,
+                            FFISlice::empty(),
+                            Error::DatabaseError(ffi_str.as_str().into()),
+                        )
+                    };
+                }
+            };
+        } else {
+            match insert_bulk_returning(
+                db,
+                model,
+                column_vec.as_slice(),
+                rows_vec
+                    .iter()
+                    .map(|x| x.as_slice())
+                    .collect::<Vec<&[Value]>>()
+                    .as_slice(),
+                returning_vec.as_slice(),
+            )
+            .await
+            {
+                Ok(v) => {
+                    let rows: Vec<&Row> = v.iter().collect();
+                    let slice = rows.as_slice().into();
+                    unsafe { cb(context, slice, Error::NoError) }
+                }
+                Err(err) => {
+                    let ffi_str = err.to_string();
+                    unsafe {
+                        cb(
+                            context,
+                            FFISlice::empty(),
+                            Error::DatabaseError(ffi_str.as_str().into()),
+                        );
+                    };
+                }
+            };
         }
     };
 
@@ -1848,23 +2099,27 @@ pub extern "C" fn rorm_db_insert(
     }
 
     let fut = async move {
-        match db
-            .insert(
-                model,
-                column_vec.as_slice(),
-                value_vec.as_slice(),
-                transaction,
-            )
-            .await
-        {
-            Err(err) => unsafe {
-                cb(
-                    context,
-                    Error::DatabaseError(err.to_string().as_str().into()),
-                )
-            },
-            Ok(_) => unsafe { cb(context, Error::NoError) },
-        };
+        if let Some(tx) = transaction {
+            match insert(tx, model, column_vec.as_slice(), value_vec.as_slice()).await {
+                Err(err) => unsafe {
+                    cb(
+                        context,
+                        Error::DatabaseError(err.to_string().as_str().into()),
+                    )
+                },
+                Ok(_) => unsafe { cb(context, Error::NoError) },
+            };
+        } else {
+            match insert(db, model, column_vec.as_slice(), value_vec.as_slice()).await {
+                Err(err) => unsafe {
+                    cb(
+                        context,
+                        Error::DatabaseError(err.to_string().as_str().into()),
+                    )
+                },
+                Ok(_) => unsafe { cb(context, Error::NoError) },
+            };
+        }
     };
 
     let f = |err: String| {
@@ -1944,8 +2199,9 @@ pub extern "C" fn rorm_db_insert_bulk(
     }
 
     let fut = async move {
-        match db
-            .insert_bulk(
+        if let Some(tx) = transaction {
+            match insert_bulk(
+                tx,
                 model,
                 column_vec.as_slice(),
                 rows_vec
@@ -1953,15 +2209,34 @@ pub extern "C" fn rorm_db_insert_bulk(
                     .map(|x| x.as_slice())
                     .collect::<Vec<&[Value]>>()
                     .as_slice(),
-                transaction,
             )
             .await
-        {
-            Ok(_) => unsafe { cb(context, Error::NoError) },
-            Err(err) => {
-                let ffi_str = err.to_string();
-                unsafe { cb(context, Error::DatabaseError(ffi_str.as_str().into())) };
-            }
+            {
+                Ok(_) => unsafe { cb(context, Error::NoError) },
+                Err(err) => {
+                    let ffi_str = err.to_string();
+                    unsafe { cb(context, Error::DatabaseError(ffi_str.as_str().into())) };
+                }
+            };
+        } else {
+            match insert_bulk(
+                db,
+                model,
+                column_vec.as_slice(),
+                rows_vec
+                    .iter()
+                    .map(|x| x.as_slice())
+                    .collect::<Vec<&[Value]>>()
+                    .as_slice(),
+            )
+            .await
+            {
+                Ok(_) => unsafe { cb(context, Error::NoError) },
+                Err(err) => {
+                    let ffi_str = err.to_string();
+                    unsafe { cb(context, Error::DatabaseError(ffi_str.as_str().into())) };
+                }
+            };
         }
     };
 
@@ -2047,10 +2322,19 @@ pub extern "C" fn rorm_db_update(
 
     let fut = async move {
         let query_res = match cond {
-            None => db.update(model, up.as_slice(), None, transaction).await,
+            None => {
+                if let Some(tx) = transaction {
+                    update(tx, model, up.as_slice(), None).await
+                } else {
+                    update(db, model, up.as_slice(), None).await
+                }
+            }
             Some(cond) => {
-                db.update(model, up.as_slice(), Some(&cond), transaction)
-                    .await
+                if let Some(tx) = transaction {
+                    update(tx, model, up.as_slice(), Some(&cond)).await
+                } else {
+                    update(db, model, up.as_slice(), Some(&cond)).await
+                }
             }
         };
 

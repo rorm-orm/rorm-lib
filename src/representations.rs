@@ -1,7 +1,8 @@
-use rorm_db::aggregation::SelectAggregator;
-use rorm_db::join_table::JoinType;
-use rorm_db::limit_clause::LimitClause;
-use rorm_db::ordering::Ordering;
+use rorm_db::sql::aggregation::SelectAggregator;
+use rorm_db::sql::join_table::JoinType;
+use rorm_db::sql::limit_clause::LimitClause;
+use rorm_db::sql::ordering::Ordering;
+use rorm_db::sql::value::NullType;
 use rorm_db::{DatabaseConfiguration, DatabaseDriver};
 
 use crate::utils::FFIOption;
@@ -15,7 +16,7 @@ This is used to determine the correct driver and the correct dialect to use.
 #[repr(i32)]
 pub enum DBBackend {
     /// This exists to forbid default initializations with 0 on C side.
-    /// Using this type will result in an [crate::errors::Error::ConfigurationError]
+    /// Using this type will result in an [Error::ConfigurationError]
     Invalid,
     /// SQLite backend
     SQLite,
@@ -28,7 +29,7 @@ pub enum DBBackend {
 /**
 Configuration operation to connect to a database.
 
-Will be converted into [rorm_db::DatabaseConfiguration].
+Will be converted into [DatabaseConfiguration].
 
 `min_connections` and `max_connections` must not be 0.
  */
@@ -100,13 +101,83 @@ impl From<DBConnectOptions<'_>> for Result<DatabaseConfiguration, Error<'_>> {
 }
 
 /**
+Representation of a [NullType]
+*/
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub enum FFINullType {
+    /// String representation
+    String,
+    /// i64 representation
+    I64,
+    /// i32 representation
+    I32,
+    /// i16 representation
+    I16,
+    /// Bool representation
+    Bool,
+    /// f64 representation
+    F64,
+    /// f32 representation
+    F32,
+    /// binary representation
+    Binary,
+    /// Naive Time representation
+    NaiveTime,
+    /// Naive Date representation
+    NaiveDate,
+    /// Naive DateTime representation
+    NaiveDateTime,
+    /// NULL choice type representation
+    Choice,
+}
+
+impl From<NullType> for FFINullType {
+    fn from(value: NullType) -> Self {
+        match value {
+            NullType::String => Self::String,
+            NullType::I64 => Self::I64,
+            NullType::I32 => Self::I32,
+            NullType::I16 => Self::I16,
+            NullType::Bool => Self::Bool,
+            NullType::F64 => Self::F64,
+            NullType::F32 => Self::F32,
+            NullType::Binary => Self::Binary,
+            NullType::NaiveTime => Self::NaiveTime,
+            NullType::NaiveDate => Self::NaiveDate,
+            NullType::NaiveDateTime => Self::NaiveDateTime,
+            NullType::Choice => Self::Choice,
+        }
+    }
+}
+
+impl From<FFINullType> for NullType {
+    fn from(value: FFINullType) -> Self {
+        match value {
+            FFINullType::String => Self::String,
+            FFINullType::I64 => Self::I64,
+            FFINullType::I32 => Self::I32,
+            FFINullType::I16 => Self::I16,
+            FFINullType::Bool => Self::Bool,
+            FFINullType::F64 => Self::F64,
+            FFINullType::F32 => Self::F32,
+            FFINullType::Binary => Self::Binary,
+            FFINullType::NaiveTime => Self::NaiveTime,
+            FFINullType::NaiveDate => Self::NaiveDate,
+            FFINullType::NaiveDateTime => Self::NaiveDateTime,
+            FFINullType::Choice => Self::Choice,
+        }
+    }
+}
+
+/**
 This enum represents a value
  */
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub enum FFIValue<'a> {
     /// null representation
-    Null,
+    Null(FFINullType),
     /// Representation of an identifier.
     /// This variant will not be escaped, so do not
     /// pass unchecked data to it.
@@ -140,15 +211,17 @@ pub enum FFIValue<'a> {
     NaiveDate(FFIDate),
     /// Representation of datetimes without timezones
     NaiveDateTime(FFIDateTime),
+    /// Representation of enum
+    Choice(FFIString<'a>),
 }
 
-impl<'a> TryFrom<&'a FFIValue<'a>> for rorm_db::value::Value<'a> {
+impl<'a> TryFrom<&'a FFIValue<'a>> for rorm_db::sql::value::Value<'a> {
     type Error = Error<'a>;
 
     fn try_from(value: &'a FFIValue<'a>) -> Result<Self, Self::Error> {
         match value {
-            FFIValue::Null => Ok(rorm_db::value::Value::Null),
-            FFIValue::Ident(x) => Ok(rorm_db::value::Value::Ident(
+            FFIValue::Null(t) => Ok(rorm_db::sql::value::Value::Null((*t).into())),
+            FFIValue::Ident(x) => Ok(rorm_db::sql::value::Value::Ident(
                 x.try_into().map_err(|_| Error::InvalidStringError)?,
             )),
             FFIValue::Column {
@@ -161,26 +234,31 @@ impl<'a> TryFrom<&'a FFIValue<'a>> for rorm_db::value::Value<'a> {
                         Some(v.try_into().map_err(|_| Error::InvalidStringError)?)
                     }
                 };
-                Ok(rorm_db::value::Value::Column {
+                Ok(rorm_db::sql::value::Value::Column {
                     table_name,
                     column_name: column_name
                         .try_into()
                         .map_err(|_| Error::InvalidStringError)?,
                 })
             }
-            FFIValue::String(x) => Ok(rorm_db::value::Value::String(
+            FFIValue::String(x) => Ok(rorm_db::sql::value::Value::String(
                 x.try_into().map_err(|_| Error::InvalidStringError)?,
             )),
-            FFIValue::I64(x) => Ok(rorm_db::value::Value::I64(*x)),
-            FFIValue::I32(x) => Ok(rorm_db::value::Value::I32(*x)),
-            FFIValue::I16(x) => Ok(rorm_db::value::Value::I16(*x)),
-            FFIValue::Bool(x) => Ok(rorm_db::value::Value::Bool(*x)),
-            FFIValue::F64(x) => Ok(rorm_db::value::Value::F64(*x)),
-            FFIValue::F32(x) => Ok(rorm_db::value::Value::F32(*x)),
-            FFIValue::Binary(x) => Ok(rorm_db::value::Value::Binary(x.into())),
-            FFIValue::NaiveTime(x) => Ok(rorm_db::value::Value::NaiveTime(x.try_into()?)),
-            FFIValue::NaiveDate(x) => Ok(rorm_db::value::Value::NaiveDate(x.try_into()?)),
-            FFIValue::NaiveDateTime(x) => Ok(rorm_db::value::Value::NaiveDateTime(x.try_into()?)),
+            FFIValue::I64(x) => Ok(rorm_db::sql::value::Value::I64(*x)),
+            FFIValue::I32(x) => Ok(rorm_db::sql::value::Value::I32(*x)),
+            FFIValue::I16(x) => Ok(rorm_db::sql::value::Value::I16(*x)),
+            FFIValue::Bool(x) => Ok(rorm_db::sql::value::Value::Bool(*x)),
+            FFIValue::F64(x) => Ok(rorm_db::sql::value::Value::F64(*x)),
+            FFIValue::F32(x) => Ok(rorm_db::sql::value::Value::F32(*x)),
+            FFIValue::Binary(x) => Ok(rorm_db::sql::value::Value::Binary(x.into())),
+            FFIValue::NaiveTime(x) => Ok(rorm_db::sql::value::Value::NaiveTime(x.try_into()?)),
+            FFIValue::NaiveDate(x) => Ok(rorm_db::sql::value::Value::NaiveDate(x.try_into()?)),
+            FFIValue::NaiveDateTime(x) => {
+                Ok(rorm_db::sql::value::Value::NaiveDateTime(x.try_into()?))
+            }
+            FFIValue::Choice(x) => Ok(rorm_db::sql::value::Value::Choice(
+                x.try_into().map_err(|_| Error::InvalidStringError)?,
+            )),
         }
     }
 }
@@ -196,7 +274,7 @@ pub enum FFITernaryCondition<'a> {
     NotBetween([&'a FFICondition<'a>; 3]),
 }
 
-impl<'a> TryFrom<&FFITernaryCondition<'a>> for rorm_db::conditional::TernaryCondition<'a> {
+impl<'a> TryFrom<&FFITernaryCondition<'a>> for rorm_db::sql::conditional::TernaryCondition<'a> {
     type Error = Error<'a>;
 
     fn try_from(value: &FFITernaryCondition<'a>) -> Result<Self, Self::Error> {
@@ -204,14 +282,14 @@ impl<'a> TryFrom<&FFITernaryCondition<'a>> for rorm_db::conditional::TernaryCond
             FFITernaryCondition::Between(x) => {
                 let [a, b, c] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?, (*c).try_into()?];
-                Ok(rorm_db::conditional::TernaryCondition::Between(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::TernaryCondition::Between(
+                    Box::new(x_conv),
+                ))
             }
             FFITernaryCondition::NotBetween(x) => {
                 let [a, b, c] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?, (*c).try_into()?];
-                Ok(rorm_db::conditional::TernaryCondition::NotBetween(
+                Ok(rorm_db::sql::conditional::TernaryCondition::NotBetween(
                     Box::new(x_conv),
                 ))
             }
@@ -250,7 +328,7 @@ pub enum FFIBinaryCondition<'a> {
     NotIn([&'a FFICondition<'a>; 2]),
 }
 
-impl<'a> TryFrom<&FFIBinaryCondition<'a>> for rorm_db::conditional::BinaryCondition<'a> {
+impl<'a> TryFrom<&FFIBinaryCondition<'a>> for rorm_db::sql::conditional::BinaryCondition<'a> {
     type Error = Error<'a>;
 
     fn try_from(value: &FFIBinaryCondition<'a>) -> Result<Self, Self::Error> {
@@ -258,82 +336,84 @@ impl<'a> TryFrom<&FFIBinaryCondition<'a>> for rorm_db::conditional::BinaryCondit
             FFIBinaryCondition::Equals(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::Equals(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::BinaryCondition::Equals(
+                    Box::new(x_conv),
+                ))
             }
             FFIBinaryCondition::NotEquals(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::NotEquals(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::BinaryCondition::NotEquals(
+                    Box::new(x_conv),
+                ))
             }
             FFIBinaryCondition::Greater(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::Greater(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::BinaryCondition::Greater(
+                    Box::new(x_conv),
+                ))
             }
             FFIBinaryCondition::GreaterOrEquals(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::GreaterOrEquals(
+                Ok(rorm_db::sql::conditional::BinaryCondition::GreaterOrEquals(
                     Box::new(x_conv),
                 ))
             }
             FFIBinaryCondition::Less(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::Less(Box::new(
+                Ok(rorm_db::sql::conditional::BinaryCondition::Less(Box::new(
                     x_conv,
                 )))
             }
             FFIBinaryCondition::LessOrEquals(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::LessOrEquals(
+                Ok(rorm_db::sql::conditional::BinaryCondition::LessOrEquals(
                     Box::new(x_conv),
                 ))
             }
             FFIBinaryCondition::Like(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::Like(Box::new(
+                Ok(rorm_db::sql::conditional::BinaryCondition::Like(Box::new(
                     x_conv,
                 )))
             }
             FFIBinaryCondition::NotLike(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::NotLike(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::BinaryCondition::NotLike(
+                    Box::new(x_conv),
+                ))
             }
             FFIBinaryCondition::Regexp(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::Regexp(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::BinaryCondition::Regexp(
+                    Box::new(x_conv),
+                ))
             }
             FFIBinaryCondition::NotRegexp(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::NotRegexp(Box::new(
-                    x_conv,
-                )))
+                Ok(rorm_db::sql::conditional::BinaryCondition::NotRegexp(
+                    Box::new(x_conv),
+                ))
             }
             FFIBinaryCondition::In(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::In(Box::new(x_conv)))
+                Ok(rorm_db::sql::conditional::BinaryCondition::In(Box::new(
+                    x_conv,
+                )))
             }
             FFIBinaryCondition::NotIn(x) => {
                 let [a, b] = x;
                 let x_conv = [(*a).try_into()?, (*b).try_into()?];
-                Ok(rorm_db::conditional::BinaryCondition::NotIn(Box::new(
+                Ok(rorm_db::sql::conditional::BinaryCondition::NotIn(Box::new(
                     x_conv,
                 )))
             }
@@ -358,26 +438,26 @@ pub enum FFIUnaryCondition<'a> {
     Not(&'a FFICondition<'a>),
 }
 
-impl<'a> TryFrom<&FFIUnaryCondition<'a>> for rorm_db::conditional::UnaryCondition<'a> {
+impl<'a> TryFrom<&FFIUnaryCondition<'a>> for rorm_db::sql::conditional::UnaryCondition<'a> {
     type Error = Error<'a>;
 
     fn try_from(value: &FFIUnaryCondition<'a>) -> Result<Self, Self::Error> {
         match value {
-            FFIUnaryCondition::IsNull(x) => Ok(rorm_db::conditional::UnaryCondition::IsNull(
+            FFIUnaryCondition::IsNull(x) => Ok(rorm_db::sql::conditional::UnaryCondition::IsNull(
                 Box::new((*x).try_into()?),
             )),
-            FFIUnaryCondition::IsNotNull(x) => Ok(rorm_db::conditional::UnaryCondition::IsNotNull(
+            FFIUnaryCondition::IsNotNull(x) => Ok(
+                rorm_db::sql::conditional::UnaryCondition::IsNotNull(Box::new((*x).try_into()?)),
+            ),
+            FFIUnaryCondition::Exists(x) => Ok(rorm_db::sql::conditional::UnaryCondition::Exists(
                 Box::new((*x).try_into()?),
             )),
-            FFIUnaryCondition::Exists(x) => Ok(rorm_db::conditional::UnaryCondition::Exists(
+            FFIUnaryCondition::NotExists(x) => Ok(
+                rorm_db::sql::conditional::UnaryCondition::NotExists(Box::new((*x).try_into()?)),
+            ),
+            FFIUnaryCondition::Not(x) => Ok(rorm_db::sql::conditional::UnaryCondition::Not(
                 Box::new((*x).try_into()?),
             )),
-            FFIUnaryCondition::NotExists(x) => Ok(rorm_db::conditional::UnaryCondition::NotExists(
-                Box::new((*x).try_into()?),
-            )),
-            FFIUnaryCondition::Not(x) => Ok(rorm_db::conditional::UnaryCondition::Not(Box::new(
-                (*x).try_into()?,
-            ))),
         }
     }
 }
@@ -401,7 +481,7 @@ pub enum FFICondition<'a> {
     Value(FFIValue<'a>),
 }
 
-impl<'a> TryFrom<&'a FFICondition<'a>> for rorm_db::conditional::Condition<'a> {
+impl<'a> TryFrom<&'a FFICondition<'a>> for rorm_db::sql::conditional::Condition<'a> {
     type Error = Error<'a>;
 
     fn try_from(value: &'a FFICondition<'a>) -> Result<Self, Self::Error> {
@@ -412,7 +492,7 @@ impl<'a> TryFrom<&'a FFICondition<'a>> for rorm_db::conditional::Condition<'a> {
                 for cond in x_conv {
                     x_vec.push(cond.try_into()?);
                 }
-                Ok(rorm_db::conditional::Condition::Conjunction(x_vec))
+                Ok(rorm_db::sql::conditional::Condition::Conjunction(x_vec))
             }
             FFICondition::Disjunction(x) => {
                 let x_conv: &[FFICondition] = x.into();
@@ -420,18 +500,20 @@ impl<'a> TryFrom<&'a FFICondition<'a>> for rorm_db::conditional::Condition<'a> {
                 for cond in x_conv {
                     x_vec.push(cond.try_into()?);
                 }
-                Ok(rorm_db::conditional::Condition::Disjunction(x_vec))
+                Ok(rorm_db::sql::conditional::Condition::Disjunction(x_vec))
             }
-            FFICondition::UnaryCondition(x) => Ok(rorm_db::conditional::Condition::UnaryCondition(
-                x.try_into()?,
-            )),
+            FFICondition::UnaryCondition(x) => Ok(
+                rorm_db::sql::conditional::Condition::UnaryCondition(x.try_into()?),
+            ),
             FFICondition::BinaryCondition(x) => Ok(
-                rorm_db::conditional::Condition::BinaryCondition(x.try_into()?),
+                rorm_db::sql::conditional::Condition::BinaryCondition(x.try_into()?),
             ),
             FFICondition::TernaryCondition(x) => Ok(
-                rorm_db::conditional::Condition::TernaryCondition(x.try_into()?),
+                rorm_db::sql::conditional::Condition::TernaryCondition(x.try_into()?),
             ),
-            FFICondition::Value(x) => Ok(rorm_db::conditional::Condition::Value(x.try_into()?)),
+            FFICondition::Value(x) => {
+                Ok(rorm_db::sql::conditional::Condition::Value(x.try_into()?))
+            }
         }
     }
 }
